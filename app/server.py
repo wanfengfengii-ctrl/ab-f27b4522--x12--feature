@@ -15,6 +15,18 @@ POST /api/x12/audit
           "sha256": "..."
         }
 
+    With ``?batch=interchanges`` the body may contain 1..16 complete
+    interchanges (each declaring its own delimiters; only CR/LF between
+    them; unique ISA13 control numbers).  Success (200)::
+
+        {
+          "interchanges": [ { ...single summary... }, ... ],
+          "interchange_count": 2,
+          "group_count": 3,
+          "transaction_count": 5,
+          "sha256": "<sha-256 of the whole batch body>"
+        }
+
     Failure (4xx)::
 
         {
@@ -24,6 +36,10 @@ POST /api/x12/audit
             "segment": 7
           }
         }
+
+    Batch failures additionally carry a 1-based ``interchange`` index; the
+    ``segment`` index is then counted from the first segment of the whole
+    batch.
 
 GET /health
     Liveness/readiness probe.  Returns ``{"status": "ok"}`` with 200 once the
@@ -37,8 +53,14 @@ import logging
 import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qsl
 
-from .audit import MAX_MESSAGE_BYTES, EnvelopeError, audit
+from .audit import (
+    MAX_MESSAGE_BYTES,
+    EnvelopeError,
+    audit,
+    audit_batch,
+)
 
 AUDIT_PATH = "/api/x12/audit"
 HEALTH_PATH = "/health"
@@ -106,7 +128,8 @@ class AuditHandler(BaseHTTPRequestHandler):
             )
 
     def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
-        if self.path.split("?", 1)[0] != AUDIT_PATH:
+        path, _, query_string = self.path.partition("?")
+        if path != AUDIT_PATH:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -118,6 +141,30 @@ class AuditHandler(BaseHTTPRequestHandler):
                 close=not keep_alive,
             )
             return
+
+        batch_mode = False
+        for key, value in parse_qsl(query_string, keep_blank_values=True):
+            if key == "batch":
+                if value == "interchanges":
+                    batch_mode = True
+                else:
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                    except ValueError:
+                        length = 0
+                    keep_alive = length >= 0 and self._drain(length)
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {
+                            "error": {
+                                "code": "INVALID_BATCH_PARAMETER",
+                                "message": "the only supported batch value is "
+                                "'interchanges'",
+                            }
+                        },
+                        close=not keep_alive,
+                    )
+                    return
 
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -172,17 +219,47 @@ class AuditHandler(BaseHTTPRequestHandler):
 
         raw = self.rfile.read(length) if length else b""
         try:
-            result = audit(raw)
+            if batch_mode:
+                result = audit_batch(raw)
+            else:
+                result = audit(raw)
         except EnvelopeError as exc:
-            logger.info("audit failed: %s at segment %s", exc.code, exc.segment)
+            logger.info(
+                "audit failed: %s at interchange %s segment %s",
+                exc.code,
+                exc.interchange,
+                exc.segment,
+            )
+            error = {
+                "code": exc.code,
+                "message": str(exc),
+                "segment": exc.segment,
+            }
+            if exc.interchange is not None:
+                error["interchange"] = exc.interchange
             self._send_json(
                 _status_for(exc.code),
+                {"error": error},
+            )
+            return
+
+        if batch_mode:
+            self._send_json(
+                HTTPStatus.OK,
                 {
-                    "error": {
-                        "code": exc.code,
-                        "message": str(exc),
-                        "segment": exc.segment,
-                    }
+                    "interchanges": [
+                        {
+                            "interchange_control_number": item.interchange_control_number,
+                            "group_count": item.group_count,
+                            "transaction_count": item.transaction_count,
+                            "sha256": item.sha256,
+                        }
+                        for item in result.interchanges
+                    ],
+                    "interchange_count": result.interchange_count,
+                    "group_count": result.group_count,
+                    "transaction_count": result.transaction_count,
+                    "sha256": result.sha256,
                 },
             )
             return

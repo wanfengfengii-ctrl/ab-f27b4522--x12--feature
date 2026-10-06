@@ -5,6 +5,7 @@
 
 - 纯 Python 3 标准库实现，无第三方依赖。
 - 单个 `POST /api/x12/audit` 接口，接收 `application/octet-stream` 原始 ASCII 报文（≤ 2 MiB）。
+- 可选 `?batch=interchanges`：同一正文承载 1..16 个**完整交换**，逐交换审计（见下文“批次模式”）。
 - 从定长 ISA 段读取三个分隔符：
   - 元素分隔符：ISA 第 4 个字节（偏移 3）
   - 组件分隔符：ISA 第 105 个字节（偏移 104，即 ISA16）
@@ -54,6 +55,68 @@ Content-Type 错误为 415）：
 
 `segment` 为首个可定位错误的 1 基段序号（ISA 为 1）。
 
+### 批次模式 `POST /api/x12/audit?batch=interchanges`
+
+省略该参数时上述契约完全不变。启用后，2 MiB 正文可包含 1..16 个完整交换：
+
+- 每个交换的 ISA **独立声明**自己的三个分隔符（支持批内分隔符切换）；
+- 交换之间仅允许出现 CR、LF 字节（零个或多个，可为空）；
+- 同批 ISA13 交换控制号必须唯一；
+- 各交换仍独立遵守组数（1..64）、事务数（≤500/组）、嵌套、配对与计数规则；
+- 错误**不会**被前一交换的合法 IEA 结束掩盖：逐交换流式解析，遇到 IEA 即停，
+  再从下一 ISA 起按其分隔符继续。
+
+成功（200）按输入顺序返回各交换摘要，并给出合计与整批 SHA-256：
+
+```json
+{
+  "interchanges": [
+    {
+      "interchange_control_number": "000000001",
+      "group_count": 1,
+      "transaction_count": 1,
+      "sha256": "…"
+    },
+    {
+      "interchange_control_number": "000000002",
+      "group_count": 2,
+      "transaction_count": 3,
+      "sha256": "…"
+    }
+  ],
+  "interchange_count": 2,
+  "group_count": 3,
+  "transaction_count": 4,
+  "sha256": "<sha-256 of the whole batch body>"
+}
+```
+
+失败（422 为主；体量/编码类沿用 400/413）时 `segment` 从**整批首段**起算，
+并额外返回 1 基 `interchange` 序号：
+
+```json
+{
+  "error": {
+    "code": "SEGMENT_COUNT_MISMATCH",
+    "message": "SE01 declares 2 segments but the ST..SE envelope spans 3",
+    "segment": 11,
+    "interchange": 2
+  }
+}
+```
+
+新增稳定错误码：
+
+| code | 含义 |
+|---|---|
+| `INTERCHANGE_LIMIT_EXCEEDED` | 批次超过 16 个交换 |
+| `DUPLICATE_CONTROL_NUMBER` | 同批两个交换的 ISA13 相同 |
+| `INTERCHANGE_JUNK` | 交换之间（或整批末尾）出现 CR/LF 以外的字节 |
+| `INVALID_BATCH_PARAMETER`（400） | `batch` 参数取值非 `interchanges` |
+
+批次模式下其余信封错误码（`SEGMENT_COUNT_MISMATCH`、`MISSING_IEA` 等）保持不变，
+但 `segment` 为全局段号、`interchange` 指向出错交换。
+
 稳定错误码：
 
 | code | 含义 |
@@ -100,9 +163,10 @@ docker compose up --build --abort-on-container-exit --exit-code-from verify veri
 `verify` 服务依次执行：
 
 1. 等待 `http://api:8080/health` 就绪；
-2. 单元测试（unittest，47 个用例）；
+2. 单元测试（unittest，67 个用例，含批次解析与错误定位）；
 3. 应用构建检查（`compileall` 字节编译）；
-4. HTTP 冒烟（有效报文 + 多种损坏信封 + 传输层错误）。
+4. HTTP 冒烟（有效报文 + 多种损坏信封 + 单交换兼容、异分隔符批次、
+   重复控制号、第二交换损坏/截断等批次场景 + 传输层错误）。
 
 退出码按位汇总：`1` 健康超时、`2` 单元测试失败、`4` 构建检查失败、`8` HTTP 冒烟失败；
 `0` 表示全部通过。
@@ -113,4 +177,9 @@ docker compose up --build --abort-on-container-exit --exit-code-from verify veri
 curl -sS --data-binary @sample.edi \
   -H 'Content-Type: application/octet-stream' \
   http://localhost:8080/api/x12/audit
+
+# 批次：一个文件内连续交付多个交换（各自分隔符、CR/LF 分隔）
+curl -sS --data-binary @batch.edi \
+  -H 'Content-Type: application/octet-stream' \
+  'http://localhost:8080/api/x12/audit?batch=interchanges'
 ```

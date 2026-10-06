@@ -7,10 +7,12 @@ import unittest
 
 from app.audit import (
     MAX_GROUPS,
+    MAX_INTERCHANGES_PER_BATCH,
     MAX_MESSAGE_BYTES,
     MAX_TRANSACTIONS_PER_GROUP,
     EnvelopeError,
     audit,
+    audit_batch,
 )
 
 ELEMENT = "*"
@@ -489,6 +491,242 @@ class CountAndControlTests(unittest.TestCase):
         with self.assertRaises(EnvelopeError) as ctx:
             audit(raw)
         self.assertEqual(ctx.exception.code, "TRANSACTION_LIMIT_EXCEEDED")
+
+
+class BatchAuditTests(unittest.TestCase):
+    def _batch(
+        self,
+        count: int,
+        *,
+        groups: list[list[int]] | None = None,
+        delimiters: list[tuple[str, str, str]] | None = None,
+        controls: list[str] | None = None,
+        gap: bytes = b"",
+        tail: bytes = b"",
+    ) -> bytes:
+        if groups is None:
+            groups = [[[0]] for _ in range(count)]
+        if controls is None:
+            controls = [f"{i + 1:09d}" for i in range(count)]
+        if delimiters is None:
+            delimiters = [
+                (ELEMENT, COMPONENT, TERMINATOR) for _ in range(count)
+            ]
+        chunks = []
+        for i in range(count):
+            chunks.append(
+                build_message(
+                    groups[i],
+                    control=controls[i],
+                    element=delimiters[i][0],
+                    component=delimiters[i][1],
+                    terminator=delimiters[i][2],
+                )
+            )
+        return gap.join(chunks) + tail
+
+    def test_single_interchange_batch_matches_audit(self):
+        raw = self._batch(1, groups=[[[0, 1]]])
+        single = audit(raw)
+        result = audit_batch(raw)
+        self.assertEqual(result.interchange_count, 1)
+        self.assertEqual(result.group_count, 1)
+        self.assertEqual(result.transaction_count, 2)
+        self.assertEqual(result.sha256, hashlib.sha256(raw).hexdigest())
+        (only,) = result.interchanges
+        self.assertEqual(only.interchange_control_number, "000000001")
+        self.assertEqual(only.group_count, single.group_count)
+        self.assertEqual(only.transaction_count, single.transaction_count)
+        self.assertEqual(only.sha256, single.sha256)
+
+    def test_multiple_interchanges_order_and_totals(self):
+        raw = self._batch(
+            3, groups=[[[0]], [[0, 0]], [[1, 2, 0]]]
+        )
+        result = audit_batch(raw)
+        self.assertEqual(
+            [item.interchange_control_number for item in result.interchanges],
+            ["000000001", "000000002", "000000003"],
+        )
+        self.assertEqual([item.group_count for item in result.interchanges], [1, 1, 1])
+        self.assertEqual(
+            [item.transaction_count for item in result.interchanges],
+            [1, 2, 3],
+        )
+        self.assertEqual(result.interchange_count, 3)
+        self.assertEqual(result.group_count, 3)
+        self.assertEqual(result.transaction_count, 6)
+        self.assertEqual(result.sha256, hashlib.sha256(raw).hexdigest())
+
+    def test_different_delimiters_per_interchange(self):
+        raw = self._batch(
+            2,
+            delimiters=[
+                (ELEMENT, COMPONENT, TERMINATOR),
+                ("|", "^", "\n"),
+            ],
+        )
+        result = audit_batch(raw)
+        self.assertEqual(result.interchange_count, 2)
+        self.assertEqual(result.transaction_count, 2)
+
+    def test_crlf_gaps_and_trailing_line_breaks(self):
+        raw = self._batch(3, gap=b"\r\n", tail=b"\r\n\r\n")
+        result = audit_batch(raw)
+        self.assertEqual(result.interchange_count, 3)
+
+    def test_no_gap_between_interchanges(self):
+        raw = self._batch(2)
+        result = audit_batch(raw)
+        self.assertEqual(result.interchange_count, 2)
+
+    def test_cr_terminator_second_interchange(self):
+        raw = self._batch(
+            2,
+            delimiters=[
+                (ELEMENT, COMPONENT, TERMINATOR),
+                ("|", "^", "\r"),
+            ],
+        )
+        result = audit_batch(raw)
+        self.assertEqual(result.interchange_count, 2)
+
+    def test_max_interchanges_accepted(self):
+        raw = self._batch(MAX_INTERCHANGES_PER_BATCH)
+        result = audit_batch(raw)
+        self.assertEqual(result.interchange_count, MAX_INTERCHANGES_PER_BATCH)
+
+    def test_too_many_interchanges(self):
+        raw = self._batch(MAX_INTERCHANGES_PER_BATCH + 1)
+        with self.assertRaises(EnvelopeError) as ctx:
+            audit_batch(raw)
+        self.assertEqual(ctx.exception.code, "INTERCHANGE_LIMIT_EXCEEDED")
+        # Each minimal interchange has 6 segments; the 17th ISA is segment 97.
+        self.assertEqual(ctx.exception.segment, 6 * MAX_INTERCHANGES_PER_BATCH + 1)
+        self.assertEqual(
+            ctx.exception.interchange, MAX_INTERCHANGES_PER_BATCH + 1
+        )
+
+    def test_duplicate_control_number(self):
+        raw = self._batch(2, controls=["000000005", "000000005"])
+        with self.assertRaises(EnvelopeError) as ctx:
+            audit_batch(raw)
+        self.assertEqual(ctx.exception.code, "DUPLICATE_CONTROL_NUMBER")
+        self.assertEqual(ctx.exception.segment, 7)
+        self.assertEqual(ctx.exception.interchange, 2)
+
+    def test_junk_between_interchanges(self):
+        first = self._batch(1)
+        second = self._batch(1, controls=["000000002"])
+        raw = first + b" " + second
+        with self.assertRaises(EnvelopeError) as ctx:
+            audit_batch(raw)
+        self.assertEqual(ctx.exception.code, "INTERCHANGE_JUNK")
+        self.assertEqual(ctx.exception.segment, 7)
+        self.assertEqual(ctx.exception.interchange, 2)
+
+    def test_tab_between_interchanges_rejected(self):
+        raw = self._batch(2, gap=b"\t")
+        with self.assertRaises(EnvelopeError) as ctx:
+            audit_batch(raw)
+        self.assertEqual(ctx.exception.code, "INTERCHANGE_JUNK")
+        self.assertEqual(ctx.exception.interchange, 2)
+
+    def test_junk_after_final_interchange(self):
+        raw = self._batch(2, tail=b"X")
+        with self.assertRaises(EnvelopeError) as ctx:
+            audit_batch(raw)
+        self.assertEqual(ctx.exception.code, "INTERCHANGE_JUNK")
+        # Trailing junk is attributed to the last complete interchange.
+        self.assertEqual(ctx.exception.interchange, 2)
+
+    def test_damaged_second_interchange_not_masked_by_first(self):
+        # First interchange is a complete, valid 6-segment message.  The
+        # second one has an SE count mismatch; the global segment index must
+        # point into the second interchange.
+        first = build_message([[0]], control="000000001")
+        second = (
+            isa("000000002")
+            + "GS*PO*S*R*D*T*1*X*V~"
+            + "ST*850*100~BEG*00~SE*2*100~"   # actual span is 3
+            + "GE*1*1~IEA*1*000000002~"
+        ).encode("ascii")
+        with self.assertRaises(EnvelopeError) as ctx:
+            audit_batch(first + second)
+        self.assertEqual(ctx.exception.code, "SEGMENT_COUNT_MISMATCH")
+        self.assertEqual(ctx.exception.segment, 11)
+        self.assertEqual(ctx.exception.interchange, 2)
+
+    def test_second_interchange_truncated(self):
+        first = build_message([[0]], control="000000001")
+        second = (
+            isa("000000002")
+            + "GS*PO*S*R*D*T*1*X*V~ST*850*100~SE*2*100~GE*1*1~"
+        ).encode("ascii")
+        with self.assertRaises(EnvelopeError) as ctx:
+            audit_batch(first + second)
+        self.assertEqual(ctx.exception.code, "MISSING_IEA")
+        self.assertEqual(ctx.exception.interchange, 2)
+        self.assertEqual(ctx.exception.segment, 11)
+
+    def test_second_isa_while_first_unclosed(self):
+        first = (
+            isa("000000001")
+            + "GS*PO*S*R*D*T*1*X*V~ST*850*100~SE*2*100~GE*1*1~"
+        ).encode("ascii")
+        second = build_message([[0]], control="000000002")
+        with self.assertRaises(EnvelopeError) as ctx:
+            audit_batch(first + second)
+        self.assertEqual(ctx.exception.code, "MISSING_IEA")
+        self.assertEqual(ctx.exception.interchange, 1)
+        self.assertEqual(ctx.exception.segment, 6)
+
+    def test_error_in_first_interchange(self):
+        first = (
+            isa("000000001")
+            + "GS*PO*S*R*D*T*1*X*V~ST*850*100~SE*2*999~GE*1*1~IEA*1*000000001~"
+        ).encode("ascii")
+        second = build_message([[0]], control="000000002")
+        with self.assertRaises(EnvelopeError) as ctx:
+            audit_batch(first + second)
+        self.assertEqual(ctx.exception.code, "CONTROL_NUMBER_MISMATCH")
+        self.assertEqual(ctx.exception.segment, 4)
+        self.assertEqual(ctx.exception.interchange, 1)
+
+    def test_missing_terminator_in_second_interchange(self):
+        first = build_message([[0]], control="000000001")
+        second = build_message([[0]], control="000000002")[:-1]
+        with self.assertRaises(EnvelopeError) as ctx:
+            audit_batch(first + second)
+        self.assertEqual(ctx.exception.code, "MISSING_TERMINATOR")
+        self.assertEqual(ctx.exception.interchange, 2)
+        self.assertEqual(ctx.exception.segment, 12)
+
+    def test_empty_batch(self):
+        with self.assertRaises(EnvelopeError) as ctx:
+            audit_batch(b"")
+        self.assertEqual(ctx.exception.code, "EMPTY_MESSAGE")
+        self.assertEqual(ctx.exception.segment, 1)
+
+    def test_non_ascii_batch(self):
+        raw = self._batch(1) + b"\x80"
+        with self.assertRaises(EnvelopeError) as ctx:
+            audit_batch(raw)
+        self.assertEqual(ctx.exception.code, "NON_ASCII")
+
+    def test_second_interchange_bad_delimiter_layout(self):
+        # A stray '~' inside a later ISA's fixed-width header must be caught
+        # using that ISA's own framing, not split on the first interchange's
+        # rules.  Construct a second ISA whose 106th byte is not a valid
+        # terminator.
+        first = build_message([[0]], control="000000001")
+        broken_isa = bytearray(isa("000000002").encode("ascii"))
+        broken_isa[105] = ord("A")  # terminator position is alphanumeric
+        with self.assertRaises(EnvelopeError) as ctx:
+            audit_batch(first + bytes(broken_isa))
+        self.assertEqual(ctx.exception.code, "BAD_DELIMITER")
+        self.assertEqual(ctx.exception.segment, 7)
+        self.assertEqual(ctx.exception.interchange, 2)
 
 
 if __name__ == "__main__":
