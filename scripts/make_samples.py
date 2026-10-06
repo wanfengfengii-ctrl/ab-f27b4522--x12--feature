@@ -1,4 +1,9 @@
-"""Generate a sample valid X12 interchange at samples/sample.edi."""
+"""Generate sample X12 interchanges under samples/.
+
+* ``sample.edi``       - a single valid interchange,
+* ``batch.edi``        - two complete interchanges separated by CRLF, each
+                         declaring its own delimiter set.
+"""
 
 from __future__ import annotations
 
@@ -27,6 +32,29 @@ def isa(control: str = "000000001") -> str:
     return "ISA*" + "*".join(fields) + "~"
 
 
+def isa_alt(control: str = "000000002") -> str:
+    """ISA declaring |, ^ and LF as its delimiter set."""
+    fields = [
+        "00",
+        " " * 10,
+        "00",
+        " " * 10,
+        "ZZ",
+        "SENDER".ljust(15),
+        "ZZ",
+        "PARTNER".ljust(15),
+        "260106",
+        "1200",
+        "U",
+        "00501",
+        control.rjust(9),
+        "0",
+        "P",
+        "^",
+    ]
+    return "ISA|" + "|".join(fields) + "\n"
+
+
 def main() -> None:
     message = (
         isa()
@@ -38,12 +66,27 @@ def main() -> None:
         + "GE*1*1~"
         + "IEA*1*000000001~"
     )
-    out_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "samples")
+    second = (
+        isa_alt()
+        + "GS|PO|SENDER|PARTNER|20260106|1200|2|X|005010\n"
+        + "ST|850|0002\n"
+        + "BEG|00|NE|PO-0002||20260106\n"
+        + "SE|3|0002\n"
+        + "GE|1|2\n"
+        + "IEA|1|000000002\n"
+    )
+    out_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "samples"
+    )
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, "sample.edi")
-    with open(path, "w", encoding="ascii", newline="") as handle:
-        handle.write(message)
-    print(f"wrote {path} ({len(message)} bytes)")
+    for name, content in (
+        ("sample.edi", message),
+        ("batch.edi", message + "\r\n" + second),
+    ):
+        path = os.path.join(out_dir, name)
+        with open(path, "w", encoding="ascii", newline="") as handle:
+            handle.write(content)
+        print(f"wrote {path} ({len(content)} bytes)")
 
 
 if __name__ == "__main__":
